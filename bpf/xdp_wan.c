@@ -34,7 +34,7 @@ int xdp_wan_redirect_prog(struct xdp_md *ctx)
 		return XDP_PASS;
 
 	ip = data + sizeof(struct ethhdr);
-	if (ip->protocol == 1)
+	if (ip->protocol == 1) /* IPPROTO_ICMP */
 		return XDP_PASS;
 
 	return bpf_redirect_map(&wan_xsks_map, 0, XDP_DROP);
