@@ -16,6 +16,23 @@
 
 #include "lab.h"
 
+static int lab_xskmap_bind(struct xsk_socket *xsk, int map_fd)
+{
+	int key = 0;
+	int xfd;
+	int err;
+
+	if (!xsk || map_fd < 0)
+		return -1;
+	xfd = xsk_socket__fd(xsk);
+	if (xfd < 0)
+		return -1;
+	err = xsk_socket__update_xskmap(xsk, map_fd);
+	if (err)
+		err = bpf_map_update_elem(map_fd, &key, &xfd, BPF_ANY);
+	return err;
+}
+
 static int pool_pop(struct lab_pair *p, uint64_t *a)
 {
 	for (;;) {
@@ -277,15 +294,20 @@ int lab_pair_open(struct lab_pair *p, const char *loc_if, const char *wan_if,
 		goto err_bpf;
 
 	{
-		int fd_loc = bpf_map__fd(bpf_object__find_map_by_name(p->bpf_loc,
-								       "xsks_map"));
-		int fd_wan = bpf_map__fd(bpf_object__find_map_by_name(p->bpf_wan,
-								      "wan_xsks_map"));
+		struct bpf_map *ml =
+			bpf_object__find_map_by_name(p->bpf_loc, "xsks_map");
+		struct bpf_map *mw =
+			bpf_object__find_map_by_name(p->bpf_wan, "wan_xsks_map");
+		int fd_loc, fd_wan;
 
+		if (!ml || !mw)
+			goto err_bpf;
+		fd_loc = bpf_map__fd(ml);
+		fd_wan = bpf_map__fd(mw);
 		if (fd_loc < 0 || fd_wan < 0)
 			goto err_bpf;
-		if (xsk_socket__update_xskmap(p->loc.xsk, fd_loc) ||
-		    xsk_socket__update_xskmap(p->wan.xsk, fd_wan))
+		if (lab_xskmap_bind(p->loc.xsk, fd_loc) ||
+		    lab_xskmap_bind(p->wan.xsk, fd_wan))
 			goto err_bpf;
 	}
 
