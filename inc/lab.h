@@ -73,12 +73,15 @@ struct lab_pair {
 	uint32_t stack_nt;
 	uint32_t stack_cap;
 	pthread_mutex_t pool_mu;
+	pthread_mutex_t umem_fq_mu;
+	pthread_mutex_t umem_cq_tx_mu;
 };
 
 int lab_ring_init(struct lab_ring *r, uint32_t cap);
 void lab_ring_destroy(struct lab_ring *r);
 int lab_ring_try_push(struct lab_ring *r, const struct lab_job *j);
 int lab_ring_try_pop(struct lab_ring *r, struct lab_job *j);
+uint32_t lab_ring_count(struct lab_ring *r);
 void lab_ring_wake_all(struct lab_ring *r);
 int lab_ring_push_retry(struct lab_ring *r, const struct lab_job *j, volatile sig_atomic_t *stop);
 
@@ -103,6 +106,16 @@ struct lab_ctx {
 	pthread_t th_loc;
 	pthread_t th_mid;
 	pthread_t th_wan;
+	int stats_on;
+	pthread_t th_stats;
+	volatile uint64_t cnt_rx_loc;
+	volatile uint64_t cnt_rx_wan;
+	volatile uint64_t cnt_tx_loc;
+	volatile uint64_t cnt_tx_wan;
+	volatile uint64_t cnt_push_ing;
+	volatile uint64_t cnt_push_wan_mid;
+	volatile uint64_t cnt_mid_wan;
+	volatile uint64_t cnt_mid_loc;
 };
 
 int lab_run(struct lab_ctx *ctx, const char *loc_if, const char *wan_if,

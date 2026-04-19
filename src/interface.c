@@ -135,6 +135,16 @@ int lab_ring_try_pop(struct lab_ring *r, struct lab_job *j)
 	return rv;
 }
 
+uint32_t lab_ring_count(struct lab_ring *r)
+{
+	uint32_t n;
+
+	pthread_mutex_lock(&r->mu);
+	n = r->count;
+	pthread_mutex_unlock(&r->mu);
+	return n;
+}
+
 int lab_ring_push_retry(struct lab_ring *r, const struct lab_job *j,
 			volatile sig_atomic_t *stop)
 {
@@ -219,6 +229,11 @@ int lab_pair_open(struct lab_pair *p, const char *loc_if, const char *wan_if,
 	memset(p, 0, sizeof(*p));
 	if (pthread_mutex_init(&p->pool_mu, NULL))
 		return -1;
+	if (pthread_mutex_init(&p->umem_fq_mu, NULL) ||
+	    pthread_mutex_init(&p->umem_cq_tx_mu, NULL)) {
+		pthread_mutex_destroy(&p->pool_mu);
+		return -1;
+	}
 	p->frame_size = LAB_FRAME;
 	p->ring_size = LAB_RING;
 	p->n_frames = LAB_RING_CAP;
@@ -226,6 +241,8 @@ int lab_pair_open(struct lab_pair *p, const char *loc_if, const char *wan_if,
 	p->bufsize = (size_t)p->n_frames * (size_t)p->frame_size;
 
 	if (setrlimit(RLIMIT_MEMLOCK, &rl)) {
+		pthread_mutex_destroy(&p->umem_cq_tx_mu);
+		pthread_mutex_destroy(&p->umem_fq_mu);
 		pthread_mutex_destroy(&p->pool_mu);
 		return -1;
 	}
@@ -233,6 +250,8 @@ int lab_pair_open(struct lab_pair *p, const char *loc_if, const char *wan_if,
 	p->bufs = mmap(NULL, p->bufsize, PROT_READ | PROT_WRITE,
 		       MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
 	if (p->bufs == MAP_FAILED) {
+		pthread_mutex_destroy(&p->umem_cq_tx_mu);
+		pthread_mutex_destroy(&p->umem_fq_mu);
 		pthread_mutex_destroy(&p->pool_mu);
 		return -1;
 	}
@@ -333,6 +352,8 @@ err_mmap:
 		munmap(p->bufs, p->bufsize);
 		p->bufs = NULL;
 	}
+	pthread_mutex_destroy(&p->umem_cq_tx_mu);
+	pthread_mutex_destroy(&p->umem_fq_mu);
 	pthread_mutex_destroy(&p->pool_mu);
 	return -1;
 }
@@ -373,6 +394,8 @@ void lab_pair_close(struct lab_pair *p)
 		munmap(p->bufs, p->bufsize);
 		p->bufs = NULL;
 	}
+	pthread_mutex_destroy(&p->umem_cq_tx_mu);
+	pthread_mutex_destroy(&p->umem_fq_mu);
 	pthread_mutex_destroy(&p->pool_mu);
 }
 
@@ -380,14 +403,19 @@ int lab_recv_loc(struct lab_pair *p, void **ptrs, uint32_t *lens,
 		 uint64_t *addrs, int max)
 {
 	uint32_t idx_rx;
-	unsigned int rcvd = xsk_ring_cons__peek(&p->loc.rx, (uint32_t)max, &idx_rx);
+	unsigned int rcvd;
 	int i, ret;
 	uint32_t idx_fq;
+	int out = 0;
 
+	pthread_mutex_lock(&p->umem_fq_mu);
+
+	rcvd = xsk_ring_cons__peek(&p->loc.rx, (uint32_t)max, &idx_rx);
 	if (!rcvd) {
 		if (xsk_ring_prod__needs_wakeup(&p->umem_fq))
 			(void)recvfrom(xsk_socket__fd(p->loc.xsk), NULL, 0,
 				       MSG_DONTWAIT, NULL, 0);
+		pthread_mutex_unlock(&p->umem_fq_mu);
 		return 0;
 	}
 
@@ -395,8 +423,10 @@ int lab_recv_loc(struct lab_pair *p, void **ptrs, uint32_t *lens,
 		ret = xsk_ring_prod__reserve(&p->umem_fq, rcvd, &idx_fq);
 		if (ret == (int)rcvd)
 			break;
-		if (ret < 0)
+		if (ret < 0) {
+			pthread_mutex_unlock(&p->umem_fq_mu);
 			return -1;
+		}
 		if (xsk_ring_prod__needs_wakeup(&p->umem_fq))
 			(void)recvfrom(xsk_socket__fd(p->loc.xsk), NULL, 0,
 				       MSG_DONTWAIT, NULL, 0);
@@ -417,21 +447,28 @@ int lab_recv_loc(struct lab_pair *p, void **ptrs, uint32_t *lens,
 	}
 	xsk_ring_prod__submit(&p->umem_fq, rcvd);
 	xsk_ring_cons__release(&p->loc.rx, rcvd);
-	return (int)rcvd;
+	out = (int)rcvd;
+	pthread_mutex_unlock(&p->umem_fq_mu);
+	return out;
 }
 
 int lab_recv_wan(struct lab_pair *p, void **ptrs, uint32_t *lens,
 		 uint64_t *addrs, int max)
 {
 	uint32_t idx_rx;
-	unsigned int rcvd = xsk_ring_cons__peek(&p->wan.rx, (uint32_t)max, &idx_rx);
+	unsigned int rcvd;
 	int i, ret;
 	uint32_t idx_fq;
+	int out = 0;
 
+	pthread_mutex_lock(&p->umem_fq_mu);
+
+	rcvd = xsk_ring_cons__peek(&p->wan.rx, (uint32_t)max, &idx_rx);
 	if (!rcvd) {
 		if (xsk_ring_prod__needs_wakeup(&p->umem_fq))
 			(void)recvfrom(xsk_socket__fd(p->wan.xsk), NULL, 0,
 				       MSG_DONTWAIT, NULL, 0);
+		pthread_mutex_unlock(&p->umem_fq_mu);
 		return 0;
 	}
 
@@ -439,8 +476,10 @@ int lab_recv_wan(struct lab_pair *p, void **ptrs, uint32_t *lens,
 		ret = xsk_ring_prod__reserve(&p->umem_fq, rcvd, &idx_fq);
 		if (ret == (int)rcvd)
 			break;
-		if (ret < 0)
+		if (ret < 0) {
+			pthread_mutex_unlock(&p->umem_fq_mu);
 			return -1;
+		}
 		if (xsk_ring_prod__needs_wakeup(&p->umem_fq))
 			(void)recvfrom(xsk_socket__fd(p->wan.xsk), NULL, 0,
 				       MSG_DONTWAIT, NULL, 0);
@@ -461,7 +500,9 @@ int lab_recv_wan(struct lab_pair *p, void **ptrs, uint32_t *lens,
 	}
 	xsk_ring_prod__submit(&p->umem_fq, rcvd);
 	xsk_ring_cons__release(&p->wan.rx, rcvd);
-	return (int)rcvd;
+	out = (int)rcvd;
+	pthread_mutex_unlock(&p->umem_fq_mu);
+	return out;
 }
 
 static int lab_tx_one(struct lab_pair *p, struct lab_zc_port *port,
@@ -470,14 +511,18 @@ static int lab_tx_one(struct lab_pair *p, struct lab_zc_port *port,
 	uint32_t idx_tx;
 	int ret;
 
+	pthread_mutex_lock(&p->umem_cq_tx_mu);
+
 	lab_complete_cq(p, XSK_RING_CONS__DEFAULT_NUM_DESCS);
 
 	for (;;) {
 		ret = xsk_ring_prod__reserve(&port->tx, 1, &idx_tx);
 		if (ret == 1)
 			break;
-		if (ret < 0)
+		if (ret < 0) {
+			pthread_mutex_unlock(&p->umem_cq_tx_mu);
 			return -1;
+		}
 		if (xsk_ring_prod__needs_wakeup(&port->tx))
 			(void)sendto(xsk_socket__fd(port->xsk), NULL, 0,
 				       MSG_DONTWAIT, NULL, 0);
@@ -486,11 +531,10 @@ static int lab_tx_one(struct lab_pair *p, struct lab_zc_port *port,
 	xsk_ring_prod__tx_desc(&port->tx, idx_tx)->addr = addr;
 	xsk_ring_prod__tx_desc(&port->tx, idx_tx)->len = len;
 	xsk_ring_prod__submit(&port->tx, 1);
+	(void)sendto(xsk_socket__fd(port->xsk), NULL, 0, MSG_DONTWAIT, NULL,
+		     0);
 
-	if (xsk_ring_prod__needs_wakeup(&port->tx))
-		(void)sendto(xsk_socket__fd(port->xsk), NULL, 0, MSG_DONTWAIT,
-			     NULL, 0);
-
+	pthread_mutex_unlock(&p->umem_cq_tx_mu);
 	return 0;
 }
 
