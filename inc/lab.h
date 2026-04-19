@@ -83,6 +83,27 @@ int lab_tx_wan(struct lab_pair *p, uint64_t addr, uint32_t len);
 
 void *lab_ptr(struct lab_pair *p, uint64_t addr);
 
+/*
+ * Counters for stderr debug (see threads.c). Updated with __sync_fetch_and_add.
+ * LAN->WAN: loc_afxdp_rx -> ing_to_mid -> mid_ing_to_wan -> w_to_wan -> wan_zc_tx_*.
+ */
+struct lab_pkt_stats {
+	uint64_t loc_afxdp_rx;
+	uint64_t ing_to_mid_enq;
+	uint64_t mid_ing_to_wan;
+	uint64_t w_to_wan_enq;
+	uint64_t wan_w2w_pop;
+	uint64_t wan_zc_tx_ok;
+	uint64_t wan_zc_tx_busy;
+	uint64_t wan_afxdp_rx;
+	uint64_t wan_to_mid_enq;
+	uint64_t mid_wan_to_loc;
+	uint64_t w_to_loc_enq;
+	uint64_t loc_w2l_pop;
+	uint64_t loc_zc_tx_ok;
+	uint64_t loc_zc_tx_busy;
+};
+
 struct lab_ctx {
 	volatile sig_atomic_t stop;
 	struct lab_pair zc;
@@ -93,6 +114,10 @@ struct lab_ctx {
 	pthread_t th_loc;
 	pthread_t th_mid;
 	pthread_t th_wan;
+	pthread_t th_dbg;
+	struct lab_pkt_stats st;
+	uint32_t dbg_hex_wan_mid;
+	uint32_t dbg_hex_wan_tx;
 };
 
 int lab_run(struct lab_ctx *ctx, const char *loc_if, const char *wan_if,
