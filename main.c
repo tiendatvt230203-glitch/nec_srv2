@@ -13,8 +13,8 @@ static void on_sig(int sig)
 
 int main(int argc, char **argv)
 {
-	const char *loc = LAB_IF_LOC;
-	const char *wan = LAB_IF_WAN;
+	const char *loc = "enp7s0";
+	const char *wan = "enp4s0";
 	const char *bpf_loc = "bpf/xdp_local.o";
 	const char *bpf_wan = "bpf/xdp_wan.o";
 

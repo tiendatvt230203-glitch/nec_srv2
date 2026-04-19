@@ -1,7 +1,6 @@
 #ifndef LAB_H
 #define LAB_H
 
-#include <net/if.h>
 #include <pthread.h>
 #include <signal.h>
 #include <stdint.h>
@@ -18,9 +17,6 @@ struct bpf_link;
 #define LAB_CPU_MID    3u
 #define LAB_CPU_WAN    11u
 
-#define LAB_IF_LOC "enp7s0"
-#define LAB_IF_WAN "enp4s0"
-
 enum lab_dir {
 	LAB_DIR_TO_WAN = 0,
 	LAB_DIR_TO_LOC = 1,
@@ -29,8 +25,6 @@ enum lab_dir {
 struct lab_job {
 	uint64_t umem_addr;
 	uint32_t len;
-	uint8_t dir;
-	uint8_t pad[3];
 };
 
 struct lab_ring {
@@ -49,13 +43,11 @@ struct lab_zc_port {
 	struct xsk_ring_cons rx;
 	struct xsk_ring_prod tx;
 	int ifindex;
-	char ifname[IF_NAMESIZE];
 };
 
 struct lab_pair {
 	void *bufs;
 	size_t bufsize;
-	uint32_t ring_size;
 	uint32_t frame_size;
 	struct xsk_umem *umem;
 	struct xsk_ring_prod umem_fq;
@@ -66,8 +58,6 @@ struct lab_pair {
 	struct bpf_object *bpf_wan;
 	struct bpf_link *lnk_loc;
 	struct bpf_link *lnk_wan;
-	int xsks_map_fd;
-	int wan_xsks_map_fd;
 	uint32_t n_frames;
 	uint64_t *frame_stack;
 	uint32_t stack_nt;
@@ -79,9 +69,7 @@ struct lab_pair {
 
 int lab_ring_init(struct lab_ring *r, uint32_t cap);
 void lab_ring_destroy(struct lab_ring *r);
-int lab_ring_try_push(struct lab_ring *r, const struct lab_job *j);
 int lab_ring_try_pop(struct lab_ring *r, struct lab_job *j);
-uint32_t lab_ring_count(struct lab_ring *r);
 void lab_ring_wake_all(struct lab_ring *r);
 int lab_ring_push_retry(struct lab_ring *r, const struct lab_job *j, volatile sig_atomic_t *stop);
 
@@ -89,8 +77,8 @@ int lab_pair_open(struct lab_pair *p, const char *loc_if, const char *wan_if,
 		  const char *bpf_loc_o, const char *bpf_wan_o);
 void lab_pair_close(struct lab_pair *p);
 
-int lab_recv_loc(struct lab_pair *p, void **ptrs, uint32_t *lens, uint64_t *addrs, int max);
-int lab_recv_wan(struct lab_pair *p, void **ptrs, uint32_t *lens, uint64_t *addrs, int max);
+int lab_recv_loc(struct lab_pair *p, uint32_t *lens, uint64_t *addrs, int max);
+int lab_recv_wan(struct lab_pair *p, uint32_t *lens, uint64_t *addrs, int max);
 int lab_tx_loc(struct lab_pair *p, uint64_t addr, uint32_t len);
 int lab_tx_wan(struct lab_pair *p, uint64_t addr, uint32_t len);
 
@@ -106,16 +94,6 @@ struct lab_ctx {
 	pthread_t th_loc;
 	pthread_t th_mid;
 	pthread_t th_wan;
-	int stats_on;
-	pthread_t th_stats;
-	volatile uint64_t cnt_rx_loc;
-	volatile uint64_t cnt_rx_wan;
-	volatile uint64_t cnt_tx_loc;
-	volatile uint64_t cnt_tx_wan;
-	volatile uint64_t cnt_push_ing;
-	volatile uint64_t cnt_push_wan_mid;
-	volatile uint64_t cnt_mid_wan;
-	volatile uint64_t cnt_mid_loc;
 };
 
 int lab_run(struct lab_ctx *ctx, const char *loc_if, const char *wan_if,

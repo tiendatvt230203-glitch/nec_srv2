@@ -1,7 +1,5 @@
 #include <pthread.h>
 #include <sched.h>
-#include <stdio.h>
-#include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 
@@ -10,42 +8,12 @@
 #include "lab.h"
 #include "mac.h"
 
-static void st_add(volatile uint64_t *c, uint64_t n)
-{
-	__sync_fetch_and_add(c, n);
-}
-
-static void *stats_thread(void *arg)
-{
-	struct lab_ctx *c = arg;
-
-	fprintf(stderr,
-		"[nec] NEC_STATS on (stderr every ~2s). rx_* = AF_XDP RX pkts, "
-		"tx_* = TX pkts, push_* / mid>* = handoff, q *= ring depth\n");
-	fflush(stderr);
-	while (!c->stop) {
-		fprintf(stderr,
-			"[nec] rx_loc=%llu rx_wan=%llu tx_loc=%llu tx_wan=%llu "
-			"push_ing=%llu push_wan_mid=%llu mid>wan=%llu mid>loc=%llu | "
-			"q ing=%u wan_mid=%u w_wan=%u w_loc=%u\n",
-			(unsigned long long)c->cnt_rx_loc,
-			(unsigned long long)c->cnt_rx_wan,
-			(unsigned long long)c->cnt_tx_loc,
-			(unsigned long long)c->cnt_tx_wan,
-			(unsigned long long)c->cnt_push_ing,
-			(unsigned long long)c->cnt_push_wan_mid,
-			(unsigned long long)c->cnt_mid_wan,
-			(unsigned long long)c->cnt_mid_loc,
-			(unsigned)lab_ring_count(&c->ing_to_mid),
-			(unsigned)lab_ring_count(&c->wan_to_mid),
-			(unsigned)lab_ring_count(&c->w_to_wan),
-			(unsigned)lab_ring_count(&c->w_to_loc));
-		fflush(stderr);
-		for (unsigned k = 0; k < 200 && !c->stop; k++)
-			usleep(10000);
-	}
-	return NULL;
-}
+/*
+ * Mỗi gói (một buffer trong UMEM dùng chung, không copy payload):
+ *   BPF XDP redirect -> AF_XDP RX (core 0 = LAN, core 11 = WAN)
+ *   -> ring -> core 3 sửa Ethernet MAC tại chỗ
+ *   -> ring -> AF_XDP TX zero-copy -> NIC đích (WAN hoặc LAN tuỳ hướng)
+ */
 
 static void setaffinity(unsigned int cpu)
 {
@@ -76,7 +44,6 @@ static void rewrite_eth(struct lab_pair *zc, uint64_t addr, enum lab_dir d)
 static void *loc_worker(void *arg)
 {
 	struct lab_ctx *ctx = arg;
-	void *ptrs[LAB_RECV_BATCH];
 	uint32_t lens[LAB_RECV_BATCH];
 	uint64_t addrs[LAB_RECV_BATCH];
 	struct lab_job j;
@@ -87,23 +54,15 @@ static void *loc_worker(void *arg)
 		if (ctx->stop)
 			break;
 		while (lab_ring_try_pop(&ctx->w_to_loc, &j) == 0) {
-			if (lab_tx_loc(&ctx->zc, j.umem_addr, j.len)) {
+			if (lab_tx_loc(&ctx->zc, j.umem_addr, j.len))
 				sched_yield();
-				continue;
-			}
-			st_add(&ctx->cnt_tx_loc, 1);
 		}
-		n = lab_recv_loc(&ctx->zc, ptrs, lens, addrs, LAB_RECV_BATCH);
-		if (n > 0)
-			st_add(&ctx->cnt_rx_loc, (uint64_t)n);
+		n = lab_recv_loc(&ctx->zc, lens, addrs, LAB_RECV_BATCH);
 		for (i = 0; i < n; i++) {
 			j.umem_addr = addrs[i];
 			j.len = lens[i];
-			j.dir = LAB_DIR_TO_WAN;
-			(void)ptrs[i];
 			if (lab_ring_push_retry(&ctx->ing_to_mid, &j, &ctx->stop))
 				break;
-			st_add(&ctx->cnt_push_ing, 1);
 		}
 		if (!n)
 			sched_yield();
@@ -114,7 +73,6 @@ static void *loc_worker(void *arg)
 static void *wan_worker(void *arg)
 {
 	struct lab_ctx *ctx = arg;
-	void *ptrs[LAB_RECV_BATCH];
 	uint32_t lens[LAB_RECV_BATCH];
 	uint64_t addrs[LAB_RECV_BATCH];
 	struct lab_job j;
@@ -125,23 +83,15 @@ static void *wan_worker(void *arg)
 		if (ctx->stop)
 			break;
 		while (lab_ring_try_pop(&ctx->w_to_wan, &j) == 0) {
-			if (lab_tx_wan(&ctx->zc, j.umem_addr, j.len)) {
+			if (lab_tx_wan(&ctx->zc, j.umem_addr, j.len))
 				sched_yield();
-				continue;
-			}
-			st_add(&ctx->cnt_tx_wan, 1);
 		}
-		n = lab_recv_wan(&ctx->zc, ptrs, lens, addrs, LAB_RECV_BATCH);
-		if (n > 0)
-			st_add(&ctx->cnt_rx_wan, (uint64_t)n);
+		n = lab_recv_wan(&ctx->zc, lens, addrs, LAB_RECV_BATCH);
 		for (i = 0; i < n; i++) {
 			j.umem_addr = addrs[i];
 			j.len = lens[i];
-			j.dir = LAB_DIR_TO_LOC;
-			(void)ptrs[i];
 			if (lab_ring_push_retry(&ctx->wan_to_mid, &j, &ctx->stop))
 				break;
-			st_add(&ctx->cnt_push_wan_mid, 1);
 		}
 		if (!n)
 			sched_yield();
@@ -162,14 +112,12 @@ static void *mid_worker(void *arg)
 			rewrite_eth(&ctx->zc, j.umem_addr, LAB_DIR_TO_WAN);
 			if (lab_ring_push_retry(&ctx->w_to_wan, &j, &ctx->stop))
 				break;
-			st_add(&ctx->cnt_mid_wan, 1);
 			continue;
 		}
 		if (lab_ring_try_pop(&ctx->wan_to_mid, &j) == 0) {
 			rewrite_eth(&ctx->zc, j.umem_addr, LAB_DIR_TO_LOC);
 			if (lab_ring_push_retry(&ctx->w_to_loc, &j, &ctx->stop))
 				break;
-			st_add(&ctx->cnt_mid_loc, 1);
 			continue;
 		}
 		sched_yield();
@@ -197,15 +145,6 @@ int lab_run(struct lab_ctx *ctx, const char *loc_if, const char *wan_if,
 		goto err_mid;
 	if (pthread_create(&ctx->th_wan, NULL, wan_worker, ctx))
 		goto err_wan;
-	{
-		const char *st = getenv("NEC_STATS");
-
-		if (st && st[0] != '0') {
-			if (pthread_create(&ctx->th_stats, NULL, stats_thread,
-					   ctx) == 0)
-				ctx->stats_on = 1;
-		}
-	}
 	return 0;
 
 err_wan:
@@ -257,10 +196,6 @@ void lab_ctx_stop(struct lab_ctx *ctx)
 
 void lab_ctx_join(struct lab_ctx *ctx)
 {
-	if (ctx->stats_on) {
-		pthread_join(ctx->th_stats, NULL);
-		ctx->stats_on = 0;
-	}
 	pthread_join(ctx->th_loc, NULL);
 	pthread_join(ctx->th_mid, NULL);
 	pthread_join(ctx->th_wan, NULL);

@@ -103,22 +103,6 @@ void lab_ring_wake_all(struct lab_ring *r)
 	pthread_mutex_unlock(&r->mu);
 }
 
-int lab_ring_try_push(struct lab_ring *r, const struct lab_job *j)
-{
-	int rv = -1;
-
-	pthread_mutex_lock(&r->mu);
-	if (r->count < r->cap) {
-		r->buf[r->tail] = *j;
-		r->tail = (r->tail + 1) % r->cap;
-		r->count++;
-		pthread_cond_signal(&r->nonempty);
-		rv = 0;
-	}
-	pthread_mutex_unlock(&r->mu);
-	return rv;
-}
-
 int lab_ring_try_pop(struct lab_ring *r, struct lab_job *j)
 {
 	int rv = -1;
@@ -133,16 +117,6 @@ int lab_ring_try_pop(struct lab_ring *r, struct lab_job *j)
 	}
 	pthread_mutex_unlock(&r->mu);
 	return rv;
-}
-
-uint32_t lab_ring_count(struct lab_ring *r)
-{
-	uint32_t n;
-
-	pthread_mutex_lock(&r->mu);
-	n = r->count;
-	pthread_mutex_unlock(&r->mu);
-	return n;
 }
 
 int lab_ring_push_retry(struct lab_ring *r, const struct lab_job *j,
@@ -235,7 +209,6 @@ int lab_pair_open(struct lab_pair *p, const char *loc_if, const char *wan_if,
 		return -1;
 	}
 	p->frame_size = LAB_FRAME;
-	p->ring_size = LAB_RING;
 	p->n_frames = LAB_RING_CAP;
 	p->stack_cap = p->n_frames;
 	p->bufsize = (size_t)p->n_frames * (size_t)p->frame_size;
@@ -272,7 +245,6 @@ int lab_pair_open(struct lab_pair *p, const char *loc_if, const char *wan_if,
 	err = lab_sock_shared(p, loc_if, &p->loc.xsk, &p->loc.rx, &p->loc.tx);
 	if (err)
 		goto err_umem;
-	strncpy(p->loc.ifname, loc_if, IF_NAMESIZE - 1);
 	p->loc.ifindex = if_nametoindex(loc_if);
 	if (!p->loc.ifindex) {
 		err = -EINVAL;
@@ -282,7 +254,6 @@ int lab_pair_open(struct lab_pair *p, const char *loc_if, const char *wan_if,
 	err = lab_sock_shared(p, wan_if, &p->wan.xsk, &p->wan.rx, &p->wan.tx);
 	if (err)
 		goto err_loc_xsk;
-	strncpy(p->wan.ifname, wan_if, IF_NAMESIZE - 1);
 	p->wan.ifindex = if_nametoindex(wan_if);
 	if (!p->wan.ifindex) {
 		err = -EINVAL;
@@ -305,15 +276,18 @@ int lab_pair_open(struct lab_pair *p, const char *loc_if, const char *wan_if,
 	if (!pl || !pw)
 		goto err_bpf;
 
-	p->xsks_map_fd = bpf_map__fd(bpf_object__find_map_by_name(p->bpf_loc, "xsks_map"));
-	p->wan_xsks_map_fd =
-		bpf_map__fd(bpf_object__find_map_by_name(p->bpf_wan, "wan_xsks_map"));
-	if (p->xsks_map_fd < 0 || p->wan_xsks_map_fd < 0)
-		goto err_bpf;
+	{
+		int fd_loc = bpf_map__fd(bpf_object__find_map_by_name(p->bpf_loc,
+								       "xsks_map"));
+		int fd_wan = bpf_map__fd(bpf_object__find_map_by_name(p->bpf_wan,
+								      "wan_xsks_map"));
 
-	if (xsk_socket__update_xskmap(p->loc.xsk, p->xsks_map_fd) ||
-	    xsk_socket__update_xskmap(p->wan.xsk, p->wan_xsks_map_fd))
-		goto err_bpf;
+		if (fd_loc < 0 || fd_wan < 0)
+			goto err_bpf;
+		if (xsk_socket__update_xskmap(p->loc.xsk, fd_loc) ||
+		    xsk_socket__update_xskmap(p->wan.xsk, fd_wan))
+			goto err_bpf;
+	}
 
 	p->lnk_loc = bpf_program__attach_xdp(pl, p->loc.ifindex);
 	p->lnk_wan = bpf_program__attach_xdp(pw, p->wan.ifindex);
@@ -399,8 +373,7 @@ void lab_pair_close(struct lab_pair *p)
 	pthread_mutex_destroy(&p->pool_mu);
 }
 
-int lab_recv_loc(struct lab_pair *p, void **ptrs, uint32_t *lens,
-		 uint64_t *addrs, int max)
+int lab_recv_loc(struct lab_pair *p, uint32_t *lens, uint64_t *addrs, int max)
 {
 	uint32_t idx_rx;
 	unsigned int rcvd;
@@ -441,7 +414,6 @@ int lab_recv_loc(struct lab_pair *p, void **ptrs, uint32_t *lens,
 
 		addrs[i] = addr;
 		lens[i] = len;
-		ptrs[i] = xsk_umem__get_data(p->bufs, addr);
 		pool_pop(p, &rep);
 		*xsk_ring_prod__fill_addr(&p->umem_fq, idx_fq++) = rep;
 	}
@@ -452,8 +424,7 @@ int lab_recv_loc(struct lab_pair *p, void **ptrs, uint32_t *lens,
 	return out;
 }
 
-int lab_recv_wan(struct lab_pair *p, void **ptrs, uint32_t *lens,
-		 uint64_t *addrs, int max)
+int lab_recv_wan(struct lab_pair *p, uint32_t *lens, uint64_t *addrs, int max)
 {
 	uint32_t idx_rx;
 	unsigned int rcvd;
@@ -494,7 +465,6 @@ int lab_recv_wan(struct lab_pair *p, void **ptrs, uint32_t *lens,
 
 		addrs[i] = addr;
 		lens[i] = len;
-		ptrs[i] = xsk_umem__get_data(p->bufs, addr);
 		pool_pop(p, &rep);
 		*xsk_ring_prod__fill_addr(&p->umem_fq, idx_fq++) = rep;
 	}
