@@ -3,6 +3,7 @@
 #include <linux/if_link.h>
 #include <linux/if_xdp.h>
 #include <sched.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
@@ -285,13 +286,51 @@ int lab_pair_open(struct lab_pair *p, const char *loc_if, const char *wan_if,
 	if (!p->bpf_loc || !p->bpf_wan)
 		goto err_wan_xsk;
 
-	if (bpf_object__load(p->bpf_loc) || bpf_object__load(p->bpf_wan))
+	if (bpf_object__load(p->bpf_loc) || bpf_object__load(p->bpf_wan)) {
+		fprintf(stderr, "[nec] bpf_object__load failed\n");
+		fflush(stderr);
 		goto err_bpf;
+	}
 
 	pl = bpf_object__find_program_by_name(p->bpf_loc, "xdp_redirect_prog");
 	pw = bpf_object__find_program_by_name(p->bpf_wan, "xdp_wan_redirect_prog");
-	if (!pl || !pw)
+	if (!pl || !pw) {
+		fprintf(stderr, "[nec] find_program_by_name failed pl=%p pw=%p\n",
+			(void *)pl, (void *)pw);
+		fflush(stderr);
 		goto err_bpf;
+	}
+
+	{
+		int ar = bpf_xdp_attach(p->loc.ifindex, bpf_program__fd(pl),
+					XDP_FLAGS_DRV_MODE, NULL);
+
+		if (ar) {
+			fprintf(stderr,
+				"[nec] bpf_xdp_attach loc ifindex=%d ret=%d (%s)\n",
+				p->loc.ifindex, ar,
+				ar < 0 ? strerror(-ar) : strerror(errno));
+			fflush(stderr);
+			goto err_bpf;
+		}
+	}
+	p->xdp_loc_on = 1;
+	{
+		int ar = bpf_xdp_attach(p->wan.ifindex, bpf_program__fd(pw),
+					XDP_FLAGS_DRV_MODE, NULL);
+
+		if (ar) {
+			fprintf(stderr,
+				"[nec] bpf_xdp_attach wan ifindex=%d ret=%d (%s)\n",
+				p->wan.ifindex, ar,
+				ar < 0 ? strerror(-ar) : strerror(errno));
+			fflush(stderr);
+			bpf_xdp_detach(p->loc.ifindex, XDP_FLAGS_DRV_MODE, NULL);
+			p->xdp_loc_on = 0;
+			goto err_bpf;
+		}
+	}
+	p->xdp_wan_on = 1;
 
 	{
 		struct bpf_map *ml =
@@ -299,32 +338,58 @@ int lab_pair_open(struct lab_pair *p, const char *loc_if, const char *wan_if,
 		struct bpf_map *mw =
 			bpf_object__find_map_by_name(p->bpf_wan, "wan_xsks_map");
 		int fd_loc, fd_wan;
+		int e1, e2;
 
-		if (!ml || !mw)
-			goto err_bpf;
+		if (!ml || !mw) {
+			fprintf(stderr,
+				"[nec] bpf_object__find_map_by_name: ml=%p mw=%p\n",
+				(void *)ml, (void *)mw);
+			fflush(stderr);
+			goto err_xdp;
+		}
 		fd_loc = bpf_map__fd(ml);
 		fd_wan = bpf_map__fd(mw);
-		if (fd_loc < 0 || fd_wan < 0)
-			goto err_bpf;
-		if (lab_xskmap_bind(p->loc.xsk, fd_loc) ||
-		    lab_xskmap_bind(p->wan.xsk, fd_wan))
-			goto err_bpf;
+		fprintf(stderr, "[nec] xsks_map fd=%d  wan_xsks_map fd=%d\n",
+			fd_loc, fd_wan);
+		fflush(stderr);
+		if (fd_loc < 0 || fd_wan < 0) {
+			fprintf(stderr, "[nec] bpf_map__fd invalid\n");
+			fflush(stderr);
+			goto err_xdp;
+		}
+		e1 = lab_xskmap_bind(p->loc.xsk, fd_loc);
+		fprintf(stderr,
+			"[nec] lab_xskmap_bind loc xsk -> xsks_map fd=%d ret=%d (%s)\n",
+			fd_loc, e1,
+			e1 == 0 ? "ok" :
+				 (e1 < 0 ? strerror(-e1) : strerror(errno)));
+		fflush(stderr);
+		e2 = lab_xskmap_bind(p->wan.xsk, fd_wan);
+		fprintf(stderr,
+			"[nec] lab_xskmap_bind wan xsk -> wan_xsks_map fd=%d ret=%d (%s)\n",
+			fd_wan, e2,
+			e2 == 0 ? "ok" :
+				 (e2 < 0 ? strerror(-e2) : strerror(errno)));
+		fflush(stderr);
+		if (e1 || e2)
+			goto err_xdp;
 	}
 
-	p->lnk_loc = bpf_program__attach_xdp(pl, p->loc.ifindex);
-	p->lnk_wan = bpf_program__attach_xdp(pw, p->wan.ifindex);
-	if (!p->lnk_loc || !p->lnk_wan)
-		goto err_bpf;
-
+	fprintf(stderr,
+		"[nec] init ok (bpftool \"map dump\" trên XSKMAP hay EOPNOTSUPP — không dùng để biết map có entry)\n");
+	fflush(stderr);
 	return 0;
 
+err_xdp:
+	if (p->xdp_wan_on) {
+		bpf_xdp_detach(p->wan.ifindex, XDP_FLAGS_DRV_MODE, NULL);
+		p->xdp_wan_on = 0;
+	}
+	if (p->xdp_loc_on) {
+		bpf_xdp_detach(p->loc.ifindex, XDP_FLAGS_DRV_MODE, NULL);
+		p->xdp_loc_on = 0;
+	}
 err_bpf:
-	if (p->lnk_wan)
-		bpf_link__destroy(p->lnk_wan);
-	p->lnk_wan = NULL;
-	if (p->lnk_loc)
-		bpf_link__destroy(p->lnk_loc);
-	p->lnk_loc = NULL;
 	if (p->bpf_wan)
 		bpf_object__close(p->bpf_wan);
 	p->bpf_wan = NULL;
@@ -356,13 +421,13 @@ err_mmap:
 
 void lab_pair_close(struct lab_pair *p)
 {
-	if (p->lnk_wan) {
-		bpf_link__destroy(p->lnk_wan);
-		p->lnk_wan = NULL;
+	if (p->xdp_wan_on) {
+		bpf_xdp_detach(p->wan.ifindex, XDP_FLAGS_DRV_MODE, NULL);
+		p->xdp_wan_on = 0;
 	}
-	if (p->lnk_loc) {
-		bpf_link__destroy(p->lnk_loc);
-		p->lnk_loc = NULL;
+	if (p->xdp_loc_on) {
+		bpf_xdp_detach(p->loc.ifindex, XDP_FLAGS_DRV_MODE, NULL);
+		p->xdp_loc_on = 0;
 	}
 	if (p->bpf_wan) {
 		bpf_object__close(p->bpf_wan);

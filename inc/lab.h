@@ -7,7 +7,6 @@
 #include <xdp/xsk.h>
 
 struct bpf_object;
-struct bpf_link;
 
 #define LAB_RING       1024u
 #define LAB_FRAME      2048u
@@ -56,8 +55,8 @@ struct lab_pair {
 	struct lab_zc_port wan;
 	struct bpf_object *bpf_loc;
 	struct bpf_object *bpf_wan;
-	struct bpf_link *lnk_loc;
-	struct bpf_link *lnk_wan;
+	uint8_t xdp_loc_on;
+	uint8_t xdp_wan_on;
 	uint32_t n_frames;
 	uint64_t *frame_stack;
 	uint32_t stack_nt;
