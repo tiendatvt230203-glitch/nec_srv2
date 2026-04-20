@@ -21,17 +21,17 @@ static void setaffinity(unsigned int cpu)
 static void rewrite_eth(struct lab_pair *zc, uint64_t addr, enum lab_dir d)
 {
 	uint8_t *pkt = lab_ptr(zc, addr);
-	static const uint8_t wan_peer[] = { MAC_WAN_PEER };
-	static const uint8_t mac_enp4[] = { MAC_ENP4S0 };
-	static const uint8_t peer_loc[] = { MAC_PEER_LOCAL };
-	static const uint8_t mac_enp7[] = { MAC_ENP7S0 };
+	static const uint8_t wan_dst[] = { MAC_WAN_DST };
+	static const uint8_t wan_src[] = { MAC_WAN_SRC };
+	static const uint8_t loc_dst[] = { MAC_LOC_DST };
+	static const uint8_t loc_src[] = { MAC_LOC_SRC };
 
 	if (d == LAB_DIR_TO_WAN) {
-		memcpy(pkt, wan_peer, ETH_ALEN);
-		memcpy(pkt + ETH_ALEN, mac_enp4, ETH_ALEN);
+		memcpy(pkt, wan_dst, ETH_ALEN);
+		memcpy(pkt + ETH_ALEN, wan_src, ETH_ALEN);
 	} else {
-		memcpy(pkt, peer_loc, ETH_ALEN);
-		memcpy(pkt + ETH_ALEN, mac_enp7, ETH_ALEN);
+		memcpy(pkt, loc_dst, ETH_ALEN);
+		memcpy(pkt + ETH_ALEN, loc_src, ETH_ALEN);
 	}
 }
 
