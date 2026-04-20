@@ -21,61 +21,15 @@ static int lab_xskmap_bind(struct xsk_socket *xsk, int map_fd)
 {
 	int key = 0;
 	int xfd;
-	int err;
 
 	if (!xsk || map_fd < 0)
 		return -1;
 	xfd = xsk_socket__fd(xsk);
 	if (xfd < 0)
 		return -1;
-	err = xsk_socket__update_xskmap(xsk, map_fd);
-	if (err)
-		err = bpf_map_update_elem(map_fd, &key, &xfd, BPF_ANY);
-	return err;
-}
-
-static int pool_pop(struct lab_pair *p, uint64_t *a)
-{
-	for (;;) {
-		pthread_mutex_lock(&p->pool_mu);
-		if (p->stack_nt > 0) {
-			*a = p->frame_stack[--p->stack_nt];
-			pthread_mutex_unlock(&p->pool_mu);
-			return 0;
-		}
-		pthread_mutex_unlock(&p->pool_mu);
-		sched_yield();
-	}
-}
-
-static void pool_push(struct lab_pair *p, uint64_t a)
-{
-	for (;;) {
-		pthread_mutex_lock(&p->pool_mu);
-		if (p->stack_nt < p->stack_cap) {
-			p->frame_stack[p->stack_nt++] = a;
-			pthread_mutex_unlock(&p->pool_mu);
-			return;
-		}
-		pthread_mutex_unlock(&p->pool_mu);
-		sched_yield();
-	}
-}
-
-static void lab_complete_cq(struct lab_pair *p, unsigned int batch)
-{
-	uint32_t idx;
-	unsigned int got = xsk_ring_cons__peek(&p->umem_cq, batch, &idx);
-
-	if (!got)
-		return;
-
-	for (unsigned int i = 0; i < got; i++) {
-		uint64_t a = *xsk_ring_cons__comp_addr(&p->umem_cq, idx++);
-
-		pool_push(p, a);
-	}
-	xsk_ring_cons__release(&p->umem_cq, got);
+	if (xsk_socket__update_xskmap(xsk, map_fd) == 0)
+		return 0;
+	return bpf_map_update_elem(map_fd, &key, &xfd, BPF_ANY);
 }
 
 int lab_ring_init(struct lab_ring *r, uint32_t cap)
@@ -163,9 +117,8 @@ void *lab_ptr(struct lab_pair *p, uint64_t addr)
 	return xsk_umem__get_data(p->bufs, addr);
 }
 
-static int lab_sock_shared(struct lab_pair *p, const char *ifn,
-			   struct xsk_socket **xsk, struct xsk_ring_cons *rx,
-			   struct xsk_ring_prod *tx)
+static int lab_sock_open(struct lab_pair *p, struct lab_zc_port *port,
+			 const char *ifn)
 {
 	struct xsk_socket_config cfg = {
 		.rx_size = XSK_RING_CONS__DEFAULT_NUM_DESCS,
@@ -175,32 +128,23 @@ static int lab_sock_shared(struct lab_pair *p, const char *ifn,
 		.bind_flags = XDP_USE_NEED_WAKEUP | XDP_COPY,
 	};
 
-	return xsk_socket__create_shared(xsk, ifn, 0, p->umem, rx, tx,
-					 &p->umem_fq, &p->umem_cq, &cfg);
+	return xsk_socket__create_shared(&port->xsk, ifn, 0, p->umem,
+					 &port->rx, &port->tx,
+					 &port->fq, &port->cq, &cfg);
 }
 
-static int lab_prime_fq(struct lab_pair *p, uint32_t want)
+static int lab_fq_fill(struct lab_zc_port *port, uint64_t base_addr,
+		       uint32_t want, uint32_t frame_size)
 {
 	uint32_t idx;
-	int ret;
 	uint32_t i;
 
-	for (;;) {
-		ret = xsk_ring_prod__reserve(&p->umem_fq, want, &idx);
-		if (ret == (int)want)
-			break;
-		if (ret < 0)
-			return -1;
-		sched_yield();
-	}
-	for (i = 0; i < want; i++) {
-		uint64_t a;
-
-		if (pool_pop(p, &a))
-			return -1;
-		*xsk_ring_prod__fill_addr(&p->umem_fq, idx++) = a;
-	}
-	xsk_ring_prod__submit(&p->umem_fq, want);
+	if (xsk_ring_prod__reserve(&port->fq, want, &idx) != want)
+		return -1;
+	for (i = 0; i < want; i++)
+		*xsk_ring_prod__fill_addr(&port->fq, idx++) =
+			base_addr + (uint64_t)i * frame_size;
+	xsk_ring_prod__submit(&port->fq, want);
 	return 0;
 }
 
@@ -209,76 +153,52 @@ int lab_pair_open(struct lab_pair *p, const char *loc_if, const char *wan_if,
 {
 	struct rlimit rl = { RLIM_INFINITY, RLIM_INFINITY };
 	struct xsk_umem_config ucfg = {
-		.fill_size = XSK_RING_PROD__DEFAULT_NUM_DESCS * 2,
+		.fill_size = XSK_RING_PROD__DEFAULT_NUM_DESCS,
 		.comp_size = XSK_RING_CONS__DEFAULT_NUM_DESCS,
 		.frame_size = LAB_FRAME,
 		.frame_headroom = XSK_UMEM__DEFAULT_FRAME_HEADROOM,
 		.flags = 0,
 	};
 	struct bpf_program *pl = NULL, *pw = NULL;
-	int err = 0;
+	struct bpf_map *ml, *mw;
+	int err;
 
 	memset(p, 0, sizeof(*p));
-	if (pthread_mutex_init(&p->pool_mu, NULL))
-		return -1;
-	if (pthread_mutex_init(&p->umem_fq_mu, NULL) ||
-	    pthread_mutex_init(&p->umem_cq_tx_mu, NULL)) {
-		pthread_mutex_destroy(&p->pool_mu);
-		return -1;
-	}
 	p->frame_size = LAB_FRAME;
 	p->n_frames = LAB_RING_CAP;
-	p->stack_cap = p->n_frames;
 	p->bufsize = (size_t)p->n_frames * (size_t)p->frame_size;
 
-	if (setrlimit(RLIMIT_MEMLOCK, &rl)) {
-		pthread_mutex_destroy(&p->umem_cq_tx_mu);
-		pthread_mutex_destroy(&p->umem_fq_mu);
-		pthread_mutex_destroy(&p->pool_mu);
-		return -1;
-	}
+	(void)setrlimit(RLIMIT_MEMLOCK, &rl);
 
 	p->bufs = mmap(NULL, p->bufsize, PROT_READ | PROT_WRITE,
 		       MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
 	if (p->bufs == MAP_FAILED) {
-		pthread_mutex_destroy(&p->umem_cq_tx_mu);
-		pthread_mutex_destroy(&p->umem_fq_mu);
-		pthread_mutex_destroy(&p->pool_mu);
+		p->bufs = NULL;
 		return -1;
 	}
 
-	p->frame_stack = calloc(p->stack_cap, sizeof(uint64_t));
-	if (!p->frame_stack)
+	err = xsk_umem__create(&p->umem, p->bufs, p->bufsize, &p->loc.fq,
+			       &p->loc.cq, &ucfg);
+	if (err)
 		goto err_mmap;
 
-	for (uint32_t i = 0; i < p->n_frames; i++)
-		p->frame_stack[i] = (uint64_t)i * p->frame_size;
-	p->stack_nt = p->n_frames;
-
-	err = xsk_umem__create(&p->umem, p->bufs, p->bufsize, &p->umem_fq,
-			       &p->umem_cq, &ucfg);
-	if (err)
-		goto err_stack;
-
-	err = lab_sock_shared(p, loc_if, &p->loc.xsk, &p->loc.rx, &p->loc.tx);
-	if (err)
+	if (lab_sock_open(p, &p->loc, loc_if))
 		goto err_umem;
 	p->loc.ifindex = if_nametoindex(loc_if);
-	if (!p->loc.ifindex) {
-		err = -EINVAL;
+	if (!p->loc.ifindex)
 		goto err_loc_xsk;
-	}
 
-	err = lab_sock_shared(p, wan_if, &p->wan.xsk, &p->wan.rx, &p->wan.tx);
-	if (err)
+	if (lab_sock_open(p, &p->wan, wan_if))
 		goto err_loc_xsk;
 	p->wan.ifindex = if_nametoindex(wan_if);
-	if (!p->wan.ifindex) {
-		err = -EINVAL;
+	if (!p->wan.ifindex)
 		goto err_wan_xsk;
-	}
 
-	if (lab_prime_fq(p, ucfg.fill_size))
+	if (lab_fq_fill(&p->loc, 0, ucfg.fill_size, p->frame_size))
+		goto err_wan_xsk;
+	if (lab_fq_fill(&p->wan,
+			(uint64_t)ucfg.fill_size * p->frame_size,
+			ucfg.fill_size, p->frame_size))
 		goto err_wan_xsk;
 
 	p->bpf_loc = bpf_object__open_file(bpf_loc_o, NULL);
@@ -286,97 +206,33 @@ int lab_pair_open(struct lab_pair *p, const char *loc_if, const char *wan_if,
 	if (!p->bpf_loc || !p->bpf_wan)
 		goto err_wan_xsk;
 
-	if (bpf_object__load(p->bpf_loc) || bpf_object__load(p->bpf_wan)) {
-		fprintf(stderr, "[nec] bpf_object__load failed\n");
-		fflush(stderr);
+	if (bpf_object__load(p->bpf_loc) || bpf_object__load(p->bpf_wan))
 		goto err_bpf;
-	}
 
 	pl = bpf_object__find_program_by_name(p->bpf_loc, "xdp_redirect_prog");
 	pw = bpf_object__find_program_by_name(p->bpf_wan, "xdp_wan_redirect_prog");
-	if (!pl || !pw) {
-		fprintf(stderr, "[nec] find_program_by_name failed pl=%p pw=%p\n",
-			(void *)pl, (void *)pw);
-		fflush(stderr);
+	if (!pl || !pw)
 		goto err_bpf;
-	}
 
-	{
-		int ar = bpf_xdp_attach(p->loc.ifindex, bpf_program__fd(pl),
-					XDP_FLAGS_SKB_MODE, NULL);
-
-		if (ar) {
-			fprintf(stderr,
-				"[nec] bpf_xdp_attach loc ifindex=%d ret=%d (%s)\n",
-				p->loc.ifindex, ar,
-				ar < 0 ? strerror(-ar) : strerror(errno));
-			fflush(stderr);
-			goto err_bpf;
-		}
-	}
+	if (bpf_xdp_attach(p->loc.ifindex, bpf_program__fd(pl),
+			   XDP_FLAGS_SKB_MODE, NULL))
+		goto err_bpf;
 	p->xdp_loc_on = 1;
-	{
-		int ar = bpf_xdp_attach(p->wan.ifindex, bpf_program__fd(pw),
-					XDP_FLAGS_SKB_MODE, NULL);
 
-		if (ar) {
-			fprintf(stderr,
-				"[nec] bpf_xdp_attach wan ifindex=%d ret=%d (%s)\n",
-				p->wan.ifindex, ar,
-				ar < 0 ? strerror(-ar) : strerror(errno));
-			fflush(stderr);
-			bpf_xdp_detach(p->loc.ifindex, XDP_FLAGS_SKB_MODE, NULL);
-			p->xdp_loc_on = 0;
-			goto err_bpf;
-		}
-	}
+	if (bpf_xdp_attach(p->wan.ifindex, bpf_program__fd(pw),
+			   XDP_FLAGS_SKB_MODE, NULL))
+		goto err_bpf;
 	p->xdp_wan_on = 1;
 
-	{
-		struct bpf_map *ml =
-			bpf_object__find_map_by_name(p->bpf_loc, "xsks_map");
-		struct bpf_map *mw =
-			bpf_object__find_map_by_name(p->bpf_wan, "wan_xsks_map");
-		int fd_loc, fd_wan;
-		int e1, e2;
+	ml = bpf_object__find_map_by_name(p->bpf_loc, "xsks_map");
+	mw = bpf_object__find_map_by_name(p->bpf_wan, "wan_xsks_map");
+	if (!ml || !mw)
+		goto err_xdp;
+	if (lab_xskmap_bind(p->loc.xsk, bpf_map__fd(ml)) ||
+	    lab_xskmap_bind(p->wan.xsk, bpf_map__fd(mw)))
+		goto err_xdp;
 
-		if (!ml || !mw) {
-			fprintf(stderr,
-				"[nec] bpf_object__find_map_by_name: ml=%p mw=%p\n",
-				(void *)ml, (void *)mw);
-			fflush(stderr);
-			goto err_xdp;
-		}
-		fd_loc = bpf_map__fd(ml);
-		fd_wan = bpf_map__fd(mw);
-		fprintf(stderr, "[nec] xsks_map fd=%d  wan_xsks_map fd=%d\n",
-			fd_loc, fd_wan);
-		fflush(stderr);
-		if (fd_loc < 0 || fd_wan < 0) {
-			fprintf(stderr, "[nec] bpf_map__fd invalid\n");
-			fflush(stderr);
-			goto err_xdp;
-		}
-		e1 = lab_xskmap_bind(p->loc.xsk, fd_loc);
-		fprintf(stderr,
-			"[nec] lab_xskmap_bind loc xsk -> xsks_map fd=%d ret=%d (%s)\n",
-			fd_loc, e1,
-			e1 == 0 ? "ok" :
-				 (e1 < 0 ? strerror(-e1) : strerror(errno)));
-		fflush(stderr);
-		e2 = lab_xskmap_bind(p->wan.xsk, fd_wan);
-		fprintf(stderr,
-			"[nec] lab_xskmap_bind wan xsk -> wan_xsks_map fd=%d ret=%d (%s)\n",
-			fd_wan, e2,
-			e2 == 0 ? "ok" :
-				 (e2 < 0 ? strerror(-e2) : strerror(errno)));
-		fflush(stderr);
-		if (e1 || e2)
-			goto err_xdp;
-	}
-
-	fprintf(stderr,
-		"[nec] init ok (bpftool \"map dump\" trên XSKMAP hay EOPNOTSUPP — không dùng để biết map có entry)\n");
+	fprintf(stderr, "[nec] init ok\n");
 	fflush(stderr);
 	return 0;
 
@@ -405,17 +261,9 @@ err_loc_xsk:
 err_umem:
 	xsk_umem__delete(p->umem);
 	p->umem = NULL;
-err_stack:
-	free(p->frame_stack);
-	p->frame_stack = NULL;
 err_mmap:
-	if (p->bufs && p->bufs != MAP_FAILED) {
-		munmap(p->bufs, p->bufsize);
-		p->bufs = NULL;
-	}
-	pthread_mutex_destroy(&p->umem_cq_tx_mu);
-	pthread_mutex_destroy(&p->umem_fq_mu);
-	pthread_mutex_destroy(&p->pool_mu);
+	munmap(p->bufs, p->bufsize);
+	p->bufs = NULL;
 	return -1;
 }
 
@@ -449,158 +297,65 @@ void lab_pair_close(struct lab_pair *p)
 		xsk_umem__delete(p->umem);
 		p->umem = NULL;
 	}
-	free(p->frame_stack);
-	p->frame_stack = NULL;
 	if (p->bufs) {
 		munmap(p->bufs, p->bufsize);
 		p->bufs = NULL;
 	}
-	pthread_mutex_destroy(&p->umem_cq_tx_mu);
-	pthread_mutex_destroy(&p->umem_fq_mu);
-	pthread_mutex_destroy(&p->pool_mu);
+}
+
+static int lab_recv_port(struct lab_zc_port *port, uint32_t *lens,
+			 uint64_t *addrs, int max)
+{
+	uint32_t idx;
+	unsigned int n;
+	unsigned int i;
+
+	n = xsk_ring_cons__peek(&port->rx, (uint32_t)max, &idx);
+	if (!n) {
+		(void)recvfrom(xsk_socket__fd(port->xsk), NULL, 0,
+			       MSG_DONTWAIT, NULL, 0);
+		return 0;
+	}
+	for (i = 0; i < n; i++) {
+		const struct xdp_desc *d =
+			xsk_ring_cons__rx_desc(&port->rx, idx + i);
+
+		addrs[i] = d->addr;
+		lens[i] = d->len;
+	}
+	xsk_ring_cons__release(&port->rx, n);
+	return (int)n;
 }
 
 int lab_recv_loc(struct lab_pair *p, uint32_t *lens, uint64_t *addrs, int max)
 {
-	uint32_t idx_rx;
-	unsigned int rcvd;
-	int i, ret;
-	uint32_t idx_fq;
-	int out = 0;
-
-	pthread_mutex_lock(&p->umem_fq_mu);
-
-	rcvd = xsk_ring_cons__peek(&p->loc.rx, (uint32_t)max, &idx_rx);
-	if (!rcvd) {
-		if (xsk_ring_prod__needs_wakeup(&p->umem_fq))
-			(void)recvfrom(xsk_socket__fd(p->loc.xsk), NULL, 0,
-				       MSG_DONTWAIT, NULL, 0);
-		pthread_mutex_unlock(&p->umem_fq_mu);
-		return 0;
-	}
-
-	for (;;) {
-		ret = xsk_ring_prod__reserve(&p->umem_fq, rcvd, &idx_fq);
-		if (ret == (int)rcvd)
-			break;
-		if (ret < 0) {
-			pthread_mutex_unlock(&p->umem_fq_mu);
-			return -1;
-		}
-		if (xsk_ring_prod__needs_wakeup(&p->umem_fq))
-			(void)recvfrom(xsk_socket__fd(p->loc.xsk), NULL, 0,
-				       MSG_DONTWAIT, NULL, 0);
-	}
-
-	for (i = 0; i < (int)rcvd; i++) {
-		const struct xdp_desc *desc =
-			xsk_ring_cons__rx_desc(&p->loc.rx, idx_rx++);
-		uint64_t addr = desc->addr;
-		uint32_t len = desc->len;
-		uint64_t rep;
-
-		addrs[i] = addr;
-		lens[i] = len;
-		pool_pop(p, &rep);
-		*xsk_ring_prod__fill_addr(&p->umem_fq, idx_fq++) = rep;
-	}
-	xsk_ring_prod__submit(&p->umem_fq, rcvd);
-	xsk_ring_cons__release(&p->loc.rx, rcvd);
-	out = (int)rcvd;
-	pthread_mutex_unlock(&p->umem_fq_mu);
-	return out;
+	return lab_recv_port(&p->loc, lens, addrs, max);
 }
 
 int lab_recv_wan(struct lab_pair *p, uint32_t *lens, uint64_t *addrs, int max)
 {
-	uint32_t idx_rx;
-	unsigned int rcvd;
-	int i, ret;
-	uint32_t idx_fq;
-	int out = 0;
-
-	pthread_mutex_lock(&p->umem_fq_mu);
-
-	rcvd = xsk_ring_cons__peek(&p->wan.rx, (uint32_t)max, &idx_rx);
-	if (!rcvd) {
-		if (xsk_ring_prod__needs_wakeup(&p->umem_fq))
-			(void)recvfrom(xsk_socket__fd(p->wan.xsk), NULL, 0,
-				       MSG_DONTWAIT, NULL, 0);
-		pthread_mutex_unlock(&p->umem_fq_mu);
-		return 0;
-	}
-
-	for (;;) {
-		ret = xsk_ring_prod__reserve(&p->umem_fq, rcvd, &idx_fq);
-		if (ret == (int)rcvd)
-			break;
-		if (ret < 0) {
-			pthread_mutex_unlock(&p->umem_fq_mu);
-			return -1;
-		}
-		if (xsk_ring_prod__needs_wakeup(&p->umem_fq))
-			(void)recvfrom(xsk_socket__fd(p->wan.xsk), NULL, 0,
-				       MSG_DONTWAIT, NULL, 0);
-	}
-
-	for (i = 0; i < (int)rcvd; i++) {
-		const struct xdp_desc *desc =
-			xsk_ring_cons__rx_desc(&p->wan.rx, idx_rx++);
-		uint64_t addr = desc->addr;
-		uint32_t len = desc->len;
-		uint64_t rep;
-
-		addrs[i] = addr;
-		lens[i] = len;
-		pool_pop(p, &rep);
-		*xsk_ring_prod__fill_addr(&p->umem_fq, idx_fq++) = rep;
-	}
-	xsk_ring_prod__submit(&p->umem_fq, rcvd);
-	xsk_ring_cons__release(&p->wan.rx, rcvd);
-	out = (int)rcvd;
-	pthread_mutex_unlock(&p->umem_fq_mu);
-	return out;
+	return lab_recv_port(&p->wan, lens, addrs, max);
 }
 
-static int lab_tx_one(struct lab_pair *p, struct lab_zc_port *port,
-		      uint64_t addr, uint32_t len)
+static int lab_tx_one(struct lab_zc_port *port, uint64_t addr, uint32_t len)
 {
-	uint32_t idx_tx;
-	int ret;
+	uint32_t idx;
 
-	pthread_mutex_lock(&p->umem_cq_tx_mu);
-
-	lab_complete_cq(p, XSK_RING_CONS__DEFAULT_NUM_DESCS);
-
-	for (;;) {
-		ret = xsk_ring_prod__reserve(&port->tx, 1, &idx_tx);
-		if (ret == 1)
-			break;
-		if (ret < 0) {
-			pthread_mutex_unlock(&p->umem_cq_tx_mu);
-			return -1;
-		}
-		if (xsk_ring_prod__needs_wakeup(&port->tx))
-			(void)sendto(xsk_socket__fd(port->xsk), NULL, 0,
-				       MSG_DONTWAIT, NULL, 0);
-	}
-
-	xsk_ring_prod__tx_desc(&port->tx, idx_tx)->addr = addr;
-	xsk_ring_prod__tx_desc(&port->tx, idx_tx)->len = len;
+	if (xsk_ring_prod__reserve(&port->tx, 1, &idx) != 1)
+		return -1;
+	xsk_ring_prod__tx_desc(&port->tx, idx)->addr = addr;
+	xsk_ring_prod__tx_desc(&port->tx, idx)->len = len;
 	xsk_ring_prod__submit(&port->tx, 1);
-	(void)sendto(xsk_socket__fd(port->xsk), NULL, 0, MSG_DONTWAIT, NULL,
-		     0);
-
-	pthread_mutex_unlock(&p->umem_cq_tx_mu);
+	(void)sendto(xsk_socket__fd(port->xsk), NULL, 0, MSG_DONTWAIT, NULL, 0);
 	return 0;
 }
 
 int lab_tx_loc(struct lab_pair *p, uint64_t addr, uint32_t len)
 {
-	return lab_tx_one(p, &p->loc, addr, len);
+	return lab_tx_one(&p->loc, addr, len);
 }
 
 int lab_tx_wan(struct lab_pair *p, uint64_t addr, uint32_t len)
 {
-	return lab_tx_one(p, &p->wan, addr, len);
+	return lab_tx_one(&p->wan, addr, len);
 }

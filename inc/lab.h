@@ -41,6 +41,8 @@ struct lab_zc_port {
 	struct xsk_socket *xsk;
 	struct xsk_ring_cons rx;
 	struct xsk_ring_prod tx;
+	struct xsk_ring_prod fq;
+	struct xsk_ring_cons cq;
 	int ifindex;
 };
 
@@ -48,29 +50,22 @@ struct lab_pair {
 	void *bufs;
 	size_t bufsize;
 	uint32_t frame_size;
+	uint32_t n_frames;
 	struct xsk_umem *umem;
-	struct xsk_ring_prod umem_fq;
-	struct xsk_ring_cons umem_cq;
 	struct lab_zc_port loc;
 	struct lab_zc_port wan;
 	struct bpf_object *bpf_loc;
 	struct bpf_object *bpf_wan;
 	uint8_t xdp_loc_on;
 	uint8_t xdp_wan_on;
-	uint32_t n_frames;
-	uint64_t *frame_stack;
-	uint32_t stack_nt;
-	uint32_t stack_cap;
-	pthread_mutex_t pool_mu;
-	pthread_mutex_t umem_fq_mu;
-	pthread_mutex_t umem_cq_tx_mu;
 };
 
 int lab_ring_init(struct lab_ring *r, uint32_t cap);
 void lab_ring_destroy(struct lab_ring *r);
 int lab_ring_try_pop(struct lab_ring *r, struct lab_job *j);
 void lab_ring_wake_all(struct lab_ring *r);
-int lab_ring_push_retry(struct lab_ring *r, const struct lab_job *j, volatile sig_atomic_t *stop);
+int lab_ring_push_retry(struct lab_ring *r, const struct lab_job *j,
+			volatile sig_atomic_t *stop);
 
 int lab_pair_open(struct lab_pair *p, const char *loc_if, const char *wan_if,
 		  const char *bpf_loc_o, const char *bpf_wan_o);
@@ -93,8 +88,6 @@ struct lab_ctx {
 	pthread_t th_loc;
 	pthread_t th_mid;
 	pthread_t th_wan;
-	uint32_t rx_idle_us;
-	int poll_idle_ms;
 };
 
 int lab_run(struct lab_ctx *ctx, const char *loc_if, const char *wan_if,
