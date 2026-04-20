@@ -44,10 +44,7 @@ int xdp_wan_redirect_prog(struct xdp_md *ctx)
 	if (ip0 + ihl_bytes > (__u8 *)data_end)
 		return XDP_PASS;
 
-	proto = *(ip0 + 9);
-	if (proto == 1)
-		return XDP_PASS;
-
+	(void)proto;
 	return bpf_redirect_map(&wan_xsks_map, 0, 0);
 }
 

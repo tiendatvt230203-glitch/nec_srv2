@@ -1,9 +1,6 @@
-#include <errno.h>
 #include <net/if.h>
 #include <linux/if_link.h>
 #include <linux/if_xdp.h>
-#include <sched.h>
-#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
@@ -232,8 +229,6 @@ int lab_pair_open(struct lab_pair *p, const char *loc_if, const char *wan_if,
 	    lab_xskmap_bind(p->wan.xsk, bpf_map__fd(mw)))
 		goto err_xdp;
 
-	fprintf(stderr, "[nec] init ok\n");
-	fflush(stderr);
 	return 0;
 
 err_xdp:
