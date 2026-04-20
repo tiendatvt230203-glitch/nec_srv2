@@ -171,8 +171,8 @@ static int lab_sock_shared(struct lab_pair *p, const char *ifn,
 		.rx_size = XSK_RING_CONS__DEFAULT_NUM_DESCS,
 		.tx_size = XSK_RING_PROD__DEFAULT_NUM_DESCS,
 		.libbpf_flags = XSK_LIBBPF_FLAGS__INHIBIT_PROG_LOAD,
-		.xdp_flags = XDP_FLAGS_DRV_MODE,
-		.bind_flags = XDP_USE_NEED_WAKEUP | XDP_ZEROCOPY,
+		.xdp_flags = XDP_FLAGS_SKB_MODE,
+		.bind_flags = XDP_USE_NEED_WAKEUP | XDP_COPY,
 	};
 
 	return xsk_socket__create_shared(xsk, ifn, 0, p->umem, rx, tx,
@@ -303,7 +303,7 @@ int lab_pair_open(struct lab_pair *p, const char *loc_if, const char *wan_if,
 
 	{
 		int ar = bpf_xdp_attach(p->loc.ifindex, bpf_program__fd(pl),
-					XDP_FLAGS_DRV_MODE, NULL);
+					XDP_FLAGS_SKB_MODE, NULL);
 
 		if (ar) {
 			fprintf(stderr,
@@ -317,7 +317,7 @@ int lab_pair_open(struct lab_pair *p, const char *loc_if, const char *wan_if,
 	p->xdp_loc_on = 1;
 	{
 		int ar = bpf_xdp_attach(p->wan.ifindex, bpf_program__fd(pw),
-					XDP_FLAGS_DRV_MODE, NULL);
+					XDP_FLAGS_SKB_MODE, NULL);
 
 		if (ar) {
 			fprintf(stderr,
@@ -325,7 +325,7 @@ int lab_pair_open(struct lab_pair *p, const char *loc_if, const char *wan_if,
 				p->wan.ifindex, ar,
 				ar < 0 ? strerror(-ar) : strerror(errno));
 			fflush(stderr);
-			bpf_xdp_detach(p->loc.ifindex, XDP_FLAGS_DRV_MODE, NULL);
+			bpf_xdp_detach(p->loc.ifindex, XDP_FLAGS_SKB_MODE, NULL);
 			p->xdp_loc_on = 0;
 			goto err_bpf;
 		}
@@ -382,11 +382,11 @@ int lab_pair_open(struct lab_pair *p, const char *loc_if, const char *wan_if,
 
 err_xdp:
 	if (p->xdp_wan_on) {
-		bpf_xdp_detach(p->wan.ifindex, XDP_FLAGS_DRV_MODE, NULL);
+		bpf_xdp_detach(p->wan.ifindex, XDP_FLAGS_SKB_MODE, NULL);
 		p->xdp_wan_on = 0;
 	}
 	if (p->xdp_loc_on) {
-		bpf_xdp_detach(p->loc.ifindex, XDP_FLAGS_DRV_MODE, NULL);
+		bpf_xdp_detach(p->loc.ifindex, XDP_FLAGS_SKB_MODE, NULL);
 		p->xdp_loc_on = 0;
 	}
 err_bpf:
@@ -422,11 +422,11 @@ err_mmap:
 void lab_pair_close(struct lab_pair *p)
 {
 	if (p->xdp_wan_on) {
-		bpf_xdp_detach(p->wan.ifindex, XDP_FLAGS_DRV_MODE, NULL);
+		bpf_xdp_detach(p->wan.ifindex, XDP_FLAGS_SKB_MODE, NULL);
 		p->xdp_wan_on = 0;
 	}
 	if (p->xdp_loc_on) {
-		bpf_xdp_detach(p->loc.ifindex, XDP_FLAGS_DRV_MODE, NULL);
+		bpf_xdp_detach(p->loc.ifindex, XDP_FLAGS_SKB_MODE, NULL);
 		p->xdp_loc_on = 0;
 	}
 	if (p->bpf_wan) {
